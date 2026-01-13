@@ -1,0 +1,973 @@
+Option Explicit
+
+'使用方法
+' Brand Risk 檔案: USE_COMPOSITE_SUBJECT_KEY=False COL_EVENT= 2 COL_ASSET=5 COL_SUBJ=6
+' Security Posture 檔案: USE_COMPOSITE_SUBJECT_KEY=True COL_EVENT= 8 COL_ASSET=6 COL_SUBJ=9 沒再用上，不維護
+'==================== 可調整區 ====================
+Private Const COL_EVENT As Long = 2     ' Event Time 欄位
+Private Const COL_ASSET As Long = 5     ' Asset 欄位
+Private Const COL_SUBJ  As Long = 6     ' Subject 欄位（Credential=6；HTTP Header=9）
+
+' 是否用「Subject + Asset」做唯一鍵
+Private Const USE_COMPOSITE_SUBJECT_KEY As Boolean = False
+Private Const KEY_DELIM As String = " | "   ' Subject 與 Asset 的呈現分隔
+
+' 上週期間（含起始日整天、含結束日整天）— 以你的需求調整
+Private Const START_Y As Long = 2025
+Private Const START_M As Long = 12
+Private Const START_D As Long = 23
+Private Const END_Y   As Long = 2025
+Private Const END_M   As Long = 12
+Private Const END_D   As Long = 30
+
+'=== 工作表名稱 ===
+Private Const SHEET_SUMMARY As String = "每週事件總覽"
+Private Const SHEET_DEDUP   As String = "事件明細(依主旨去重)"
+Private Const SHEET_CLASSIFY As String = "主旨分類(依網域彙整)"
+
+
+' 字典鍵是否大小寫不敏感（True=不分大小寫；False=區分）
+Private Const CASE_INSENSITIVE As Boolean = False
+'=================================================
+
+Public Sub AnalyzeLeaks()
+    Dim ws As Worksheet: Set ws = ActiveSheet  ' 以目前工作表為來源
+    
+    
+    ' ================================================
+    ' 重新命名目前的工作表為「原始資料」
+    On Error Resume Next
+    ws.Name = "原始資料"
+    If Err.Number <> 0 Then
+        ws.Name = "原始資料_" & Format(Now, "hhmmss")
+        Err.Clear
+    End If
+    On Error GoTo 0
+
+    Dim lastRow As Long: lastRow = GetLastRow(ws, COL_SUBJ)
+    If lastRow < 2 Then
+        MsgBox "找不到資料列（至少需含表頭與一列資料）。", vbExclamation
+        Exit Sub
+    End If
+
+    ' ================================================
+
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+
+    Dim startDate As Date, endDateExclusive As Date
+    startDate = DateSerial(START_Y, START_M, START_D)
+    endDateExclusive = DateSerial(END_Y, END_M, END_D + 1) ' 半開區間：[start, end+1day)
+
+    ' 建字典（全部以「key」= Subject 或 Subject+Asset 為唯一識別）
+    Dim dictFirstSeen As Object, dictSeenInWeek As Object
+    Dim dictDedupRow As Object, dictAllSubjects As Object, dictCounts As Object
+    Dim dictWeekRow As Object             ' key -> 週內第一筆 row
+
+    Set dictFirstSeen = CreateObject("Scripting.Dictionary")
+    Set dictSeenInWeek = CreateObject("Scripting.Dictionary")
+    Set dictDedupRow = CreateObject("Scripting.Dictionary")
+    Set dictAllSubjects = CreateObject("Scripting.Dictionary")
+    Set dictCounts = CreateObject("Scripting.Dictionary")
+    Set dictWeekRow = CreateObject("Scripting.Dictionary")
+
+    If CASE_INSENSITIVE Then
+        dictFirstSeen.CompareMode = vbTextCompare
+        dictSeenInWeek.CompareMode = vbTextCompare
+        dictDedupRow.CompareMode = vbTextCompare
+        dictAllSubjects.CompareMode = vbTextCompare
+        dictCounts.CompareMode = vbTextCompare
+        dictWeekRow.CompareMode = vbTextCompare
+    End If
+
+    Dim r As Long
+    For r = 2 To lastRow
+        Dim key As String
+        key = BuildSubjectKey(ws, r)            ' ← 單一/複合 key 由這裡決定
+        If Len(key) = 0 Then GoTo NextR
+
+        Dim dt As Date
+        dt = ParseDateTimeSafe(ws.Cells(r, COL_EVENT).Value)
+        If dt <= 0 Then GoTo NextR
+
+        ' 全部 Subject 集合（去重）
+        If Not dictAllSubjects.Exists(key) Then dictAllSubjects.Add key, True
+
+        ' 計數（如果要用）
+        If Not dictCounts.Exists(key) Then
+            dictCounts.Add key, 1
+        Else
+            dictCounts(key) = dictCounts(key) + 1
+        End If
+
+        ' 首見時間（取最早）
+        If Not dictFirstSeen.Exists(key) Then
+            dictFirstSeen.Add key, dt
+        ElseIf dt < dictFirstSeen(key) Then
+            dictFirstSeen(key) = dt
+        End If
+
+        ' 週內出現情況紀錄
+        If dt >= startDate And dt < endDateExclusive Then
+            dictSeenInWeek(key) = True
+            If Not dictWeekRow.Exists(key) Then dictWeekRow(key) = r
+        End If
+
+        ' 去重：保留第一筆完整列
+        If Not dictDedupRow.Exists(key) Then dictDedupRow.Add key, r
+
+NextR:
+    Next r
+
+    ' 準備集合陣列
+    Dim lastWeekList() As String, totalList() As String
+    lastWeekList = DictKeysToArray(dictSeenInWeek)
+    totalList = DictKeysToArray(dictAllSubjects)
+
+    ' NewThisWeek：首見時間在本週（代表過去從未出現）
+    Dim newThisWeekList() As String
+    Dim k As Variant, fs As Date
+    For Each k In dictSeenInWeek.Keys
+        fs = dictFirstSeen(k)
+        If (fs >= startDate) And (fs < endDateExclusive) Then
+            AppendString newThisWeekList, CStr(k)
+        End If
+    Next k
+
+    ' 依清單組出要拷貝的列號陣列
+    Dim weekRows() As Long: weekRows = DictValuesToLongArray(dictWeekRow)        ' 上週清單（本週期間內第一筆）
+    Dim newRows() As Long:  newRows = RowsFromSubjects(dictWeekRow, newThisWeekList)  ' 新增清單（同上、對應首筆）
+
+    ' 產出「本週新增」清單，放在最前面
+    Dim weekName As String
+    weekName = "本周" & Format$(START_M, "00") & Format$(START_D, "00") & "-" & Format$(END_M, "00") & Format$(END_D, "00") & "新增"
+    WriteNewThisWeekSheet ws, newRows, SHEET_NAME:=weekName
+
+    ' 產出 Leak Summary（統計 + 兩個完整清單）
+    WriteSummaryReport ws, lastWeekList, totalList, newThisWeekList, weekRows, newRows, startDate, DateAdd("d", -1, endDateExclusive)
+
+    ' 產出依 Subject 去重的明細（保留第一筆整列）
+    WriteDedupSheet ws, dictDedupRow, SHEET_DEDUP
+
+
+    ' === 新增：依網域彙整帳號 + 拍賣訊息 ===
+    WriteSubjectClassificationFromDedup SHEET_DEDUP, SHEET_CLASSIFY
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+
+    MsgBox "完成：已建立 """ & SHEET_SUMMARY & """ 與 """ & SHEET_DEDUP & """ 與 """ & weekName & """", vbInformation
+
+    ' 將該工作表移動到最後一個位置
+    ws.Move After:=Worksheets(Worksheets.Count)
+End Sub
+
+'==================== 輔助函式 ====================
+
+' 取得某欄最後一列（多層防呆版）
+Private Function GetLastRow(ByVal ws As Worksheet, ByVal col As Long) As Long
+    On Error GoTo Fallback
+    If ws Is Nothing Then Set ws = ActiveSheet
+    If col < 1 Or col > ws.Columns.Count Then
+        GetLastRow = 1
+        Exit Function
+    End If
+    Dim lr As Long
+    lr = ws.Cells(ws.Rows.Count, col).End(xlUp).Row
+    If lr < 1 Then lr = 1
+    GetLastRow = lr
+    Exit Function
+Fallback:
+    On Error Resume Next
+    If ws Is Nothing Then
+        GetLastRow = 1
+    Else
+        Dim ur As Range
+        Set ur = ws.UsedRange
+        If ur Is Nothing Then
+            GetLastRow = 1
+        Else
+            GetLastRow = ur.Row + ur.Rows.Count - 1
+            If GetLastRow < 1 Then GetLastRow = 1
+        End If
+    End If
+    On Error GoTo 0
+End Function
+
+' 文字清洗（通用）
+Private Function SanitizeText(ByVal v As Variant) As String
+    Dim s As String
+    s = CStr(v)
+    s = Replace(s, Chr(160), "")          ' 不換行空白
+    s = Replace(s, ChrW(&H3000), "")      ' 全形空白
+    s = Trim$(s)
+    SanitizeText = s
+End Function
+
+' 建唯一鍵：Subject 或 Subject + Asset
+Private Function BuildSubjectKey(ByVal ws As Worksheet, ByVal rowNo As Long) As String
+    Dim subj As String, asset As String
+    subj = SanitizeText(ws.Cells(rowNo, COL_SUBJ).Value)
+    If USE_COMPOSITE_SUBJECT_KEY Then
+        asset = SanitizeText(ws.Cells(rowNo, COL_ASSET).Value)
+        If Len(subj) = 0 And Len(asset) = 0 Then
+            BuildSubjectKey = vbNullString
+        ElseIf Len(asset) = 0 Then
+            BuildSubjectKey = subj
+        ElseIf Len(subj) = 0 Then
+            BuildSubjectKey = asset
+        Else
+            BuildSubjectKey = subj & KEY_DELIM & asset
+        End If
+    Else
+        BuildSubjectKey = subj
+    End If
+End Function
+
+' 安全解析日期時間：支援 "yyyy/mm/dd hh:mm"；無效回傳 0
+Private Function ParseDateTimeSafe(ByVal v As Variant) As Date
+    On Error GoTo Fallback
+    If IsDate(v) Then
+        ParseDateTimeSafe = CDate(v)
+        Exit Function
+    End If
+    Dim s As String: s = Trim$(CStr(v))
+    If Len(s) = 0 Then GoTo Fallback
+
+    Dim parts() As String: parts = Split(s, " ")
+    Dim y As Long, m As Long, d As Long, hh As Long, nn As Long
+    Dim dtPart As String, tmPart As String
+
+    dtPart = parts(0)
+    If InStr(dtPart, "/") > 0 Then
+        Dim dmy() As String: dmy = Split(dtPart, "/")
+        If UBound(dmy) >= 2 Then
+            y = CLng(dmy(0)): m = CLng(dmy(1)): d = CLng(dmy(2))
+        Else
+            GoTo Fallback
+        End If
+    Else
+        GoTo Fallback
+    End If
+
+    If UBound(parts) >= 1 Then
+        tmPart = parts(1)
+        If InStr(tmPart, ":") > 0 Then
+            Dim hms() As String: hms = Split(tmPart, ":")
+            hh = CLng(hms(0)): nn = CLng(hms(1))
+        End If
+    End If
+
+    If hh = 0 And nn = 0 Then
+        ParseDateTimeSafe = DateSerial(y, m, d)
+    Else
+        ParseDateTimeSafe = DateSerial(y, m, d) + TimeSerial(hh, nn, 0)
+    End If
+    Exit Function
+Fallback:
+    ParseDateTimeSafe = 0
+End Function
+
+' 將字典的 Keys 轉為字串陣列（若為空，回傳未初始化的動態陣列）
+Private Function DictKeysToArray(ByVal dict As Object) As String()
+    Dim arr() As String
+    If (dict Is Nothing) Or (dict.Count = 0) Then
+        DictKeysToArray = arr
+        Exit Function
+    End If
+    Dim k As Variant, i As Long
+    ReDim arr(0 To dict.Count - 1)
+    i = 0
+    For Each k In dict.Keys
+        arr(i) = CStr(k)
+        i = i + 1
+    Next
+    DictKeysToArray = arr
+End Function
+
+' 安全計算字串陣列長度
+Private Function SafeCountStringArray(ByRef arr() As String) As Long
+    On Error GoTo EmptyArr
+    SafeCountStringArray = UBound(arr) - LBound(arr) + 1
+    Exit Function
+EmptyArr:
+    SafeCountStringArray = 0
+End Function
+
+' 動態加入字串到動態陣列尾端
+Private Sub AppendString(ByRef arr() As String, ByVal s As String)
+    On Error GoTo First
+    Dim n As Long
+    n = UBound(arr) + 1
+    ReDim Preserve arr(0 To n)
+    arr(n) = s
+    Exit Sub
+First:
+    ReDim arr(0 To 0)
+    arr(0) = s
+End Sub
+
+'==================== Leak Summary（統計 + 兩個完整清單） ====================
+
+Public Sub WriteSummaryReport(ByVal wsSrc As Worksheet, _
+                              ByRef lastWeekList() As String, _
+                              ByRef totalList() As String, _
+                              ByRef newThisWeekList() As String, _
+                              ByRef weekRows() As Long, _
+                              ByRef newRows() As Long, _
+                              ByVal startDate As Date, _
+                              ByVal endDateInclusive As Date)
+
+    On Error Resume Next
+    Application.DisplayAlerts = False
+    Worksheets(SHEET_SUMMARY).Delete
+    Application.DisplayAlerts = True
+    On Error GoTo 0
+
+    Dim wsOut As Worksheet
+    Set wsOut = Worksheets.Add(After:=Worksheets(Worksheets.Count))
+    wsOut.Name = SHEET_SUMMARY
+
+    ' ===== 上方統計區 =====
+    Dim r As Long: r = 1
+    wsOut.Cells(r, 1).Value = "期間"
+    wsOut.Cells(r, 2).Value = Format$(startDate, "yyyy/mm/dd") & " - " & Format$(endDateInclusive, "yyyy/mm/dd")
+    r = r + 1
+    wsOut.Cells(r, 1).Value = "Total（依 Subject 去重）"
+    wsOut.Cells(r, 2).Value = SafeCountStringArray(totalList)
+    r = r + 1
+    wsOut.Cells(r, 1).Value = "LastWeek（上周出現之 Subject 去重）"
+    wsOut.Cells(r, 2).Value = SafeCountStringArray(lastWeekList)
+    r = r + 1
+    wsOut.Cells(r, 1).Value = "NewThisWeek（上週首次出現）"
+    wsOut.Cells(r, 2).Value = SafeCountStringArray(newThisWeekList)
+    wsOut.Rows("1:1").Font.Bold = True
+
+    Dim lastCol As Long
+    lastCol = GetLastColSafe(wsSrc)
+    If lastCol < 1 Then lastCol = 1
+
+    ' ===== 完整清單：LastWeek =====
+    r = r + 2
+    wsOut.Cells(r, 1).Value = "LastWeek 清單（依 Subject 去重）"
+    wsOut.Rows(r).Font.Bold = True
+    r = r + 1
+
+    ' 表頭
+    wsOut.Cells(r, 1).Resize(1, lastCol).Value = wsSrc.Cells(1, 1).Resize(1, lastCol).Value
+    wsOut.Rows(r).RowHeight = wsSrc.Rows(1).RowHeight
+    Call SyncColumnsFormat(wsSrc, wsOut, lastCol)
+
+    Dim startListRow As Long, outRow As Long, i As Long
+    startListRow = r + 1
+    outRow = startListRow
+
+    Dim lo As Long, hi As Long
+    lo = SafeLBoundLong(weekRows)
+    hi = SafeUBoundLong(weekRows)
+    If hi >= lo Then
+        For i = lo To hi
+            If weekRows(i) >= 2 Then
+                wsOut.Cells(outRow, 1).Resize(1, lastCol).Value = _
+                    wsSrc.Cells(weekRows(i), 1).Resize(1, lastCol).Value
+                wsOut.Rows(outRow).RowHeight = wsSrc.Rows(weekRows(i)).RowHeight
+                outRow = outRow + 1
+            End If
+        Next i
+    End If
+
+    Call BeautifyBlockLikeSource(wsSrc, wsOut, r, lastCol, outRow - 1)
+
+    ' ===== 完整清單：NewThisWeek =====
+    r = outRow + 2
+    wsOut.Cells(r, 1).Value = "NewThisWeek 清單"
+    wsOut.Rows(r).Font.Bold = False
+    r = r + 1
+
+    wsOut.Cells(r, 1).Resize(1, lastCol).Value = wsSrc.Cells(1, 1).Resize(1, lastCol).Value
+    wsOut.Rows(r).RowHeight = wsSrc.Rows(1).RowHeight
+
+    startListRow = r + 1
+    outRow = startListRow
+
+    lo = SafeLBoundLong(newRows)
+    hi = SafeUBoundLong(newRows)
+    If hi >= lo Then
+        For i = lo To hi
+            If newRows(i) >= 2 Then
+                wsOut.Cells(outRow, 1).Resize(1, lastCol).Value = _
+                    wsSrc.Cells(newRows(i), 1).Resize(1, lastCol).Value
+                wsOut.Rows(outRow).RowHeight = wsSrc.Rows(newRows(i)).RowHeight
+                outRow = outRow + 1
+            End If
+        Next i
+    End If
+
+    Call BeautifyBlockLikeSource(wsSrc, wsOut, r, lastCol, outRow - 1)
+
+    ' 視覺微調
+    wsOut.Columns.AutoFit
+End Sub
+
+' 把字典的 value(=row) 轉成 Long 陣列
+Private Function DictValuesToLongArray(ByVal dict As Object) As Long()
+    Dim arr() As Long
+    If (dict Is Nothing) Or dict.Count = 0 Then
+        DictValuesToLongArray = arr
+        Exit Function
+    End If
+    Dim i As Long, v As Variant
+    ReDim arr(0 To dict.Count - 1)
+    i = 0
+    For Each v In dict.Items
+        arr(i) = CLng(v)
+        i = i + 1
+    Next v
+    DictValuesToLongArray = arr
+End Function
+
+' 依 subject 清單，用 subj->row 的字典取回列號陣列
+Private Function RowsFromSubjects(ByVal subj2Row As Object, ByRef subjs() As String) As Long()
+    Dim arr() As Long
+    On Error GoTo EmptyRet
+    ReDim arr(LBound(subjs) To UBound(subjs))
+    Dim i As Long
+    For i = LBound(subjs) To UBound(subjs)
+        If subj2Row.Exists(subjs(i)) Then
+            arr(i) = CLng(subj2Row(subjs(i)))
+        Else
+            arr(i) = 0
+        End If
+    Next i
+    RowsFromSubjects = arr
+    Exit Function
+EmptyRet:
+    ' 未初始化：呼叫端用 SafeUBoundLong 判斷
+End Function
+
+' 安全取得 Long() 的 UBound，未初始化則回 -1
+Private Function SafeUBoundLong(ByRef arr() As Long) As Long
+    On Error GoTo NoArr
+    SafeUBoundLong = UBound(arr)
+    Exit Function
+NoArr:
+    SafeUBoundLong = -1
+End Function
+
+' 安全取得 Long() 的 LBound，未初始化則回 0
+Private Function SafeLBoundLong(ByRef arr() As Long) As Long
+    On Error GoTo NoArr
+    SafeLBoundLong = LBound(arr)
+    Exit Function
+NoArr:
+    SafeLBoundLong = 0
+End Function
+
+' 同步欄寬、欄格式、字型對齊/換行/縮排
+Private Sub SyncColumnsFormat(ByVal wsSrc As Worksheet, ByVal wsOut As Worksheet, ByVal lastCol As Long)
+    Dim c As Long
+    For c = 1 To lastCol
+        With wsOut.Columns(c)
+            .ColumnWidth = wsSrc.Columns(c).ColumnWidth
+            .NumberFormat = wsSrc.Columns(c).NumberFormat
+            .HorizontalAlignment = wsSrc.Columns(c).HorizontalAlignment
+            .VerticalAlignment = wsSrc.Columns(c).VerticalAlignment
+            .WrapText = wsSrc.Columns(c).WrapText
+            .IndentLevel = wsSrc.Columns(c).IndentLevel
+            .Font.Name = wsSrc.Columns(c).Font.Name
+            .Font.Size = wsSrc.Columns(c).Font.Size
+            On Error Resume Next
+            .Font.Color = wsSrc.Columns(c).Font.Color
+            On Error GoTo 0
+            .Font.Bold = wsSrc.Columns(c).Font.Bold
+            .Font.Italic = wsSrc.Columns(c).Font.Italic
+            .Font.Underline = wsSrc.Columns(c).Font.Underline
+        End With
+    Next c
+End Sub
+
+' 模擬來源是表格則沿用 TableStyle；否則加邊框與自動篩選
+Private Sub BeautifyBlockLikeSource(ByVal wsSrc As Worksheet, ByVal wsOut As Worksheet, _
+                                    ByVal headerRow As Long, ByVal lastCol As Long, ByVal lastDataRow As Long)
+    If lastDataRow < headerRow Then Exit Sub
+
+    Dim haveStyledTable As Boolean: haveStyledTable = False
+    Dim loSrc As ListObject, loOut As ListObject
+
+    If wsSrc.ListObjects.Count > 0 Then
+        For Each loSrc In wsSrc.ListObjects
+            If Not loSrc Is Nothing Then
+                If loSrc.HeaderRowRange.Row = 1 Then
+                    haveStyledTable = True
+                    Exit For
+                End If
+            End If
+        Next loSrc
+    End If
+
+    Dim rngAll As Range
+    Set rngAll = wsOut.Range(wsOut.Cells(headerRow, 1), wsOut.Cells(lastDataRow, lastCol))
+
+    If haveStyledTable Then
+        Set loOut = wsOut.ListObjects.Add( _
+            SourceType:=xlSrcRange, _
+            Source:=rngAll, _
+            XlListObjectHasHeaders:=xlYes)
+        On Error Resume Next
+        loOut.TableStyle = loSrc.TableStyle
+        loOut.ShowAutoFilterDropDown = True
+        On Error GoTo 0
+    Else
+        With rngAll.Borders
+            .LineStyle = xlContinuous
+            .Weight = xlThin
+        End With
+        rngAll.Borders(xlInsideHorizontal).LineStyle = xlContinuous
+        rngAll.Borders(xlInsideVertical).LineStyle = xlContinuous
+        rngAll.AutoFilter
+    End If
+End Sub
+
+' 產出：依 Subject 去重的明細（保留第一筆）＋帶原表格式（欄寬/格式/字型/列高/邊框/凍結）
+Private Sub WriteDedupSheet(ByVal wsSrc As Worksheet, ByVal dictRow As Object, ByVal sheetName As String)
+    On Error Resume Next
+    Application.DisplayAlerts = False
+    Worksheets(sheetName).Delete
+    Application.DisplayAlerts = True
+    On Error GoTo 0
+
+    Dim wsOut As Worksheet
+    Set wsOut = Worksheets.Add(After:=Worksheets(Worksheets.Count))
+    wsOut.Name = sheetName
+
+    Dim lastCol As Long
+    lastCol = GetLastColSafe(wsSrc)
+    If lastCol < 1 Then lastCol = 1
+
+    wsOut.Cells(1, 1).Resize(1, lastCol).Value = wsSrc.Cells(1, 1).Resize(1, lastCol).Value
+
+    Dim rOut As Long: rOut = 2
+    Dim k As Variant, rSrc As Long
+    For Each k In dictRow.Keys
+        rSrc = CLng(dictRow(k))
+        If rSrc >= 2 Then
+            wsOut.Cells(rOut, 1).Resize(1, lastCol).Value = wsSrc.Cells(rSrc, 1).Resize(1, lastCol).Value
+            On Error Resume Next
+            wsOut.Rows(rOut).RowHeight = wsSrc.Rows(rSrc).RowHeight
+            On Error GoTo 0
+            rOut = rOut + 1
+        End If
+    Next k
+
+    Dim c As Long
+    For c = 1 To lastCol
+        wsOut.Columns(c).ColumnWidth = wsSrc.Columns(c).ColumnWidth
+    Next c
+
+    For c = 1 To lastCol
+        With wsOut.Columns(c)
+            .NumberFormat = wsSrc.Columns(c).NumberFormat
+            .HorizontalAlignment = wsSrc.Columns(c).HorizontalAlignment
+            .VerticalAlignment = wsSrc.Columns(c).VerticalAlignment
+            .WrapText = wsSrc.Columns(c).WrapText
+            .IndentLevel = wsSrc.Columns(c).IndentLevel
+            .Font.Name = wsSrc.Columns(c).Font.Name
+            .Font.Size = wsSrc.Columns(c).Font.Size
+            On Error Resume Next
+            .Font.Color = wsSrc.Columns(c).Font.Color
+            On Error GoTo 0
+            .Font.Bold = wsSrc.Columns(c).Font.Bold
+            .Font.Italic = wsSrc.Columns(c).Font.Italic
+            .Font.Underline = wsSrc.Columns(c).Font.Underline
+        End With
+    Next c
+
+    With wsOut.Rows(1)
+        .Font.Bold = True
+        .HorizontalAlignment = wsSrc.Rows(1).HorizontalAlignment
+        .VerticalAlignment = wsSrc.Rows(1).VerticalAlignment
+        On Error Resume Next
+        .Interior.Color = wsSrc.Rows(1).Interior.Color
+        .RowHeight = wsSrc.Rows(1).RowHeight
+        On Error GoTo 0
+    End With
+
+    Dim haveStyledTable As Boolean: haveStyledTable = False
+    Dim loSrc As ListObject, loOut As ListObject
+    Dim dataLastRow As Long: dataLastRow = rOut - 1
+
+    If wsSrc.ListObjects.Count > 0 Then
+        For Each loSrc In wsSrc.ListObjects
+            If Not loSrc Is Nothing Then
+                If loSrc.HeaderRowRange.Row = 1 Then
+                    haveStyledTable = True
+                    Exit For
+                End If
+            End If
+        Next loSrc
+    End If
+
+    If haveStyledTable And dataLastRow >= 1 Then
+        Set loOut = wsOut.ListObjects.Add( _
+            SourceType:=xlSrcRange, _
+            Source:=wsOut.Range(wsOut.Cells(1, 1), wsOut.Cells(Application.Max(1, dataLastRow), lastCol)), _
+            XlListObjectHasHeaders:=xlYes)
+        On Error Resume Next
+        loOut.TableStyle = loSrc.TableStyle
+        loOut.ShowAutoFilterDropDown = True
+        On Error GoTo 0
+    Else
+        If dataLastRow >= 1 Then
+            Dim rngAll As Range
+            Set rngAll = wsOut.Range(wsOut.Cells(1, 1), wsOut.Cells(Application.Max(1, dataLastRow), lastCol))
+            With rngAll.Borders
+                .LineStyle = xlContinuous
+                .Weight = xlThin
+            End With
+            rngAll.Borders(xlInsideHorizontal).LineStyle = xlContinuous
+            rngAll.Borders(xlInsideVertical).LineStyle = xlContinuous
+            rngAll.AutoFilter
+        End If
+    End If
+
+    ' 凍結表頭
+    wsOut.Activate
+    With ActiveWindow
+        .SplitColumn = 0
+        .SplitRow = 1
+        .FreezePanes = True
+    End With
+
+    ' 套日期時間格式（Event Time）
+    With wsOut.Columns(COL_EVENT)
+        .NumberFormat = "yyyy/m/d  hh:mm:ss [$-409]AM/PM"
+        .EntireColumn.AutoFit
+        If .ColumnWidth < 20 Then .ColumnWidth = 20
+    End With
+    ' 也把 Last Seen 欄位（用表頭名找）套同樣的日期格式
+    Dim colLastSeen As Long
+    colLastSeen = FindColumnByHeader(wsOut, "Last Seen")
+    If colLastSeen > 0 Then
+        With wsOut.Columns(colLastSeen)
+            .NumberFormat = "yyyy/m/d  hh:mm:ss [$-409]AM/PM"
+            .EntireColumn.AutoFit
+            If .ColumnWidth < 20 Then .ColumnWidth = 20
+        End With
+    End If
+End Sub
+
+' 找出第一列最後一個非空欄（比 .End(xlToLeft) 穩）
+Private Function GetLastColSafe(ByVal ws As Worksheet) As Long
+    Dim f As Range
+    Set f = ws.Rows(1).Find(What:="*", LookIn:=xlFormulas, LookAt:=xlPart, _
+                            SearchOrder:=xlByColumns, SearchDirection:=xlPrevious, MatchCase:=False)
+    If Not f Is Nothing Then
+        GetLastColSafe = f.Column
+    Else
+        GetLastColSafe = 1
+    End If
+End Function
+
+
+
+' 依表頭文字找欄位（第1列），大小寫不敏感；找不到回 0
+Private Function FindColumnByHeader(ByVal ws As Worksheet, ByVal headerText As String) As Long
+    Dim c As Long, lastCol As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        If LCase$(Trim$(CStr(ws.Cells(1, c).Value))) = LCase$(Trim$(headerText)) Then
+            FindColumnByHeader = c
+            Exit Function
+        End If
+    Next c
+    FindColumnByHeader = 0
+End Function
+
+
+
+
+'=================================================
+' 產出：本週新增清單（依 Subject 去重；完整列）
+'=================================================
+Private Sub WriteNewThisWeekSheet(ByVal wsSrc As Worksheet, _
+                                  ByRef newRows() As Long, _
+                                  ByVal SHEET_NAME As String)
+    On Error Resume Next
+    Application.DisplayAlerts = False
+    Worksheets(SHEET_NAME).Delete
+    Application.DisplayAlerts = True
+    On Error GoTo 0
+
+    Dim wsOut As Worksheet
+    Set wsOut = Worksheets.Add(Before:=Worksheets(1))   ' ← 放在第一個工作表
+    wsOut.Name = SHEET_NAME
+
+    Dim lastCol As Long
+    lastCol = GetLastColSafe(wsSrc)
+    If lastCol < 1 Then lastCol = 1
+
+    ' ===== 標題區 =====
+    Dim r As Long
+    r = 1
+    wsOut.Cells(r, 1).Value = "NewThisWeek 清單"
+    wsOut.Rows(r).Font.Bold = True
+    wsOut.Rows(r).Font.Size = 11
+    r = r + 1
+
+    ' ===== 表頭 =====
+    wsOut.Cells(r, 1).Resize(1, lastCol).Value = wsSrc.Cells(1, 1).Resize(1, lastCol).Value
+    wsOut.Rows(r).RowHeight = wsSrc.Rows(1).RowHeight
+    wsOut.Rows(r).Font.Bold = True
+    Call SyncColumnsFormat(wsSrc, wsOut, lastCol)
+
+    ' ===== 資料列 =====
+    Dim lo As Long, hi As Long, i As Long, outRow As Long
+    lo = SafeLBoundLong(newRows)
+    hi = SafeUBoundLong(newRows)
+    outRow = r + 1
+
+    If hi >= lo Then
+        For i = lo To hi
+            If newRows(i) >= 2 Then
+                wsOut.Cells(outRow, 1).Resize(1, lastCol).Value = _
+                    wsSrc.Cells(newRows(i), 1).Resize(1, lastCol).Value
+                wsOut.Rows(outRow).RowHeight = wsSrc.Rows(newRows(i)).RowHeight
+                outRow = outRow + 1
+            End If
+        Next i
+    End If
+
+    ' ===== 套表格樣式或邊框 =====
+    Call BeautifyBlockLikeSource(wsSrc, wsOut, r, lastCol, outRow - 1)
+
+    ' ===== 套日期格式 =====
+    With wsOut.Columns(COL_EVENT)
+        .NumberFormat = "yyyy/m/d  hh:mm:ss [$-409]AM/PM"
+        .EntireColumn.AutoFit
+        If .ColumnWidth < 20 Then .ColumnWidth = 20
+    End With
+
+    ' ===== 凍結表頭 =====
+    wsOut.Activate
+    With ActiveWindow
+        .SplitColumn = 0
+        .SplitRow = r
+        .FreezePanes = True
+    End With
+
+    wsOut.Columns.AutoFit
+End Sub
+
+
+'=================================================
+' 依主旨去重表單，解析 Subject 並彙整：
+'  - 型態1：「Credential of <acct> has been leaked for accessing <domain>」
+'      -> 以 <domain> 分組，彙整帳號（去重）
+'  - 型態2：「A marketplace is auctioning the credentials associated with <domain>.」
+'      -> 另行列出於「市場拍賣／其他資訊」區塊
+'  產出工作表：SHEET_CLASSIFY
+'=================================================
+Private Sub WriteSubjectClassificationFromDedup(ByVal sheetDedupName As String, ByVal outSheetName As String)
+    Dim wsDedup As Worksheet
+    On Error Resume Next
+    Set wsDedup = Worksheets(sheetDedupName)
+    On Error GoTo 0
+    If wsDedup Is Nothing Then
+        MsgBox "找不到來源工作表：「" & sheetDedupName & "」。", vbExclamation
+        Exit Sub
+    End If
+
+    Dim lastRow As Long
+    lastRow = GetLastRow(wsDedup, COL_SUBJ)
+    If lastRow < 2 Then
+        MsgBox "來源表無資料可分類。", vbExclamation
+        Exit Sub
+    End If
+
+    Dim reLeak As Object, reMarket As Object
+    Set reLeak = CreateObject("VBScript.RegExp")
+    With reLeak
+        .Pattern = "Credential\s+of\s+(.+?)\s+has\s+been\s+leaked\s+for\s+accessing\s+([A-Za-z0-9\.\-]+)"
+        .IgnoreCase = True
+        .Global = False
+    End With
+
+    Set reMarket = CreateObject("VBScript.RegExp")
+    With reMarket
+        .Pattern = "marketplace\s+is\s+auctioning\s+the\s+credentials\s+associated\s+with\s+([A-Za-z0-9\.\-]+)"
+        .IgnoreCase = True
+        .Global = False
+    End With
+
+    ' dom2acc(domain -> dict(account->True))
+    Dim dom2acc As Object: Set dom2acc = CreateObject("Scripting.Dictionary")
+    If CASE_INSENSITIVE Then dom2acc.CompareMode = vbTextCompare
+
+    ' 拍賣/其他列表：每項為 Array(domain, subject)
+    Dim marketList As Collection: Set marketList = New Collection
+
+    Dim r As Long, subj As String
+    Dim leaksCount As Long, marketCount As Long
+
+    For r = 2 To lastRow
+        subj = CStr(wsDedup.Cells(r, COL_SUBJ).Value)
+        subj = SanitizeText(subj)
+        If Len(subj) = 0 Then GoTo CONTINUE_FOR
+
+        Dim m, account As String, domain As String
+
+        If reLeak.Test(subj) Then
+            Set m = reLeak.Execute(subj)(0)
+            account = CleanAccount(CStr(m.SubMatches(0)))
+            domain = CleanDomain(CStr(m.SubMatches(1)))
+            If Len(domain) > 0 And Len(account) > 0 Then
+                If Not dom2acc.Exists(domain) Then
+                    Set dom2acc(domain) = CreateObject("Scripting.Dictionary")
+                    If CASE_INSENSITIVE Then dom2acc(domain).CompareMode = vbTextCompare
+                End If
+                dom2acc(domain)(account) = True   ' 去重
+                leaksCount = leaksCount + 1
+            End If
+
+        ElseIf reMarket.Test(subj) Then
+            Set m = reMarket.Execute(subj)(0)
+            domain = CleanDomain(CStr(m.SubMatches(0)))
+            marketList.Add Array(domain, subj)
+            marketCount = marketCount + 1
+
+        End If
+
+CONTINUE_FOR:
+    Next r
+
+    ' 產出目標工作表
+    On Error Resume Next
+    Application.DisplayAlerts = False
+    Worksheets(outSheetName).Delete
+    Application.DisplayAlerts = True
+    On Error GoTo 0
+
+    Dim wsOut As Worksheet
+    Set wsOut = Worksheets.Add(After:=Worksheets(Worksheets.Count))
+    wsOut.Name = outSheetName
+
+    Dim outR As Long: outR = 1
+
+    ' 標題/來源
+    wsOut.Cells(outR, 1).Value = "主旨分類（依網域彙整）"
+    wsOut.Rows(outR).Font.Bold = True
+    wsOut.Rows(outR).Font.Size = 12
+    outR = outR + 1
+    wsOut.Cells(outR, 1).Value = "來源工作表：" & sheetDedupName
+    outR = outR + 2
+
+    ' ===== 區塊1：依網域彙整帳號 =====
+    Dim headerRow1 As Long: headerRow1 = outR
+    wsOut.Cells(outR, 1).Value = "Domain"
+    wsOut.Cells(outR, 2).Value = "帳號（去重）"
+    wsOut.Cells(outR, 3).Value = "帳號數"
+    wsOut.Rows(outR).Font.Bold = True
+    outR = outR + 1
+
+    Dim domains() As String
+    domains = DictKeysToArray(dom2acc)
+    SortStringArray domains
+
+    Dim i As Long, accDict As Object, accs() As String, totalAccounts As Long
+    If SafeCountStringArray(domains) > 0 Then
+        For i = LBound(domains) To UBound(domains)
+            Set accDict = dom2acc(domains(i))
+            accs = DictKeysToArray(accDict)
+            SortStringArray accs
+
+            wsOut.Cells(outR, 1).Value = domains(i)
+            wsOut.Cells(outR, 2).Value = Join(accs, "、")
+            wsOut.Cells(outR, 3).Value = SafeCountStringArray(accs)
+            totalAccounts = totalAccounts + SafeCountStringArray(accs)
+            outR = outR + 1
+        Next i
+        BeautifyBlockLikeSource wsDedup, wsOut, headerRow1, 3, outR - 1
+    Else
+        wsOut.Cells(outR, 1).Value = "(無符合「帳號洩漏」型主旨)"
+        outR = outR + 1
+    End If
+
+    outR = outR + 2
+
+    ' ===== 區塊2：市場拍賣／其他資訊 =====
+    wsOut.Cells(outR, 1).Value = "市場拍賣／其他資訊"
+    wsOut.Rows(outR).Font.Bold = True
+    outR = outR + 1
+    Dim headerRow2 As Long: headerRow2 = outR
+    wsOut.Cells(outR, 1).Value = "Domain"
+    wsOut.Cells(outR, 2).Value = "Subject"
+    wsOut.Rows(outR).Font.Bold = True
+    outR = outR + 1
+
+    If marketList.Count > 0 Then
+        Dim idx As Long, item
+        For idx = 1 To marketList.Count
+            item = marketList(idx)
+            wsOut.Cells(outR, 1).Value = CStr(item(0))
+            wsOut.Cells(outR, 2).Value = CStr(item(1))
+            outR = outR + 1
+        Next idx
+        BeautifyBlockLikeSource wsDedup, wsOut, headerRow2, 2, outR - 1
+    Else
+        wsOut.Cells(outR, 1).Value = "(無市場拍賣型主旨)"
+        outR = outR + 1
+    End If
+
+    outR = outR + 2
+
+    ' ===== 統計 =====
+    wsOut.Cells(outR, 1).Value = "統計"
+    wsOut.Rows(outR).Font.Bold = True
+    outR = outR + 1
+
+    wsOut.Cells(outR, 1).Value = "涉及網域數"
+    wsOut.Cells(outR, 2).Value = dom2acc.Count
+    outR = outR + 1
+
+    wsOut.Cells(outR, 1).Value = "帳號總數（去重）"
+    wsOut.Cells(outR, 2).Value = totalAccounts
+    outR = outR + 1
+
+    wsOut.Cells(outR, 1).Value = "市場拍賣訊息數"
+    wsOut.Cells(outR, 2).Value = marketList.Count
+    outR = outR + 1
+
+    wsOut.Columns.AutoFit
+End Sub
+
+' 乾淨化擷取到的帳號
+Private Function CleanAccount(ByVal s As String) As String
+    s = SanitizeText(s)
+    s = Replace(s, """", "")
+    s = Replace(s, "'", "")
+    If Right$(s, 1) = "." Then s = Left$(s, Len(s) - 1)
+    CleanAccount = s
+End Function
+
+' 乾淨化擷取到的網域
+Private Function CleanDomain(ByVal s As String) As String
+    s = SanitizeText(s)
+    If Right$(s, 1) = "." Then s = Left$(s, Len(s) - 1)
+    CleanDomain = s
+End Function
+
+' 對字串陣列做簡易排序（不分大小寫）；未初始化則直接略過
+Private Sub SortStringArray(ByRef arr() As String)
+    On Error GoTo NO_ARR
+    Dim i As Long, j As Long, tmp As String
+    For i = LBound(arr) To UBound(arr) - 1
+        For j = i + 1 To UBound(arr)
+            If StrComp(arr(i), arr(j), vbTextCompare) > 0 Then
+                tmp = arr(i): arr(i) = arr(j): arr(j) = tmp
+            End If
+        Next j
+    Next i
+    Exit Sub
+NO_ARR:
+    ' 未初始化：不處理
+End Sub
