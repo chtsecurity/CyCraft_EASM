@@ -28,7 +28,7 @@ A VBA automation tool for deduplicating, analyzing, and categorizing CyCraft EAS
 | **Brand Risk** | 2 | 5 | 6 | False |
 | **Security Posture** | 8 | 6 | 9 | True | (沒再用上，不維護)
  
-![alt text](images/image.png)
+![alt text](images/image-3.png)
 
 ### 3. 設定分析週期
 請手動調整程式碼中的 `START` 與 `END` 年/月/日，以定義本週分析的時間範圍。
@@ -37,11 +37,11 @@ A VBA automation tool for deduplicating, analyzing, and categorizing CyCraft EAS
 
 * **本周新增清單**：放置在第一個工作表，列出本週首次偵測到的高風險洩漏。
 
-![alt text](image-2.png)
+![alt text](images/image-2.png)
 
 * **每週事件總覽**：提供期間統計數據，包括總數、上週出現數以及本週新增數。
 
-![alt text](image-1.png)
+![alt text](images/image-1.png)
 
 
 * **事件明細(依主旨去重)**：完整的歷史資料去重清單，保留每項事件的最早紀錄。
@@ -52,7 +52,7 @@ A VBA automation tool for deduplicating, analyzing, and categorizing CyCraft EAS
 
 * **主旨分類(依網域彙整)**：核心分析結果，將洩漏帳號依受影響網域分類並統計帳號數量。
 
-![alt text](image.png)
+![alt text](images/image.png)
 
 
 ---
